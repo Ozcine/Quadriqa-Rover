@@ -1,0 +1,344 @@
+/*
+ * ESP32-S3 Robot Kontrol
+ * --------------------------------------------------------
+ * Donanım:
+ *   - ESP32-S3 Dev Board
+ *   - 4× BTS7960 (sol 2 motor + sağ 2 motor, tank steering)
+ *   - 2× BTS7960 (robot kol: alt eksen + üst eksen)
+ *   - 2 kanallı röle modülü
+ *   - Tüm BTS7960 EN pinleri direkt 5V'a bağlı
+ *
+ * Kontrol: WiFi AP + telefonda tarayıcı üzerinden buton kontrolü
+ * Latch davranışı:
+ *   - Röle 1 (kalkış): araç hareketteyken aktif
+ *   - Röle 2 (duruş):  araç dururken aktif
+ *
+ * Arduino-ESP32 core 3.x üzerinde derlenir (yeni ledcAttach API).
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ============= AP AYARLARI =============
+const char* AP_SSID = "Robot-Kontrol";
+const char* AP_PASS = "12345678";   // en az 8 karakter olmalı
+
+// ============= PİN TANIMLARI =============
+// Sol grup (2 motor, BTS7960'ların PWM girişleri paralel)
+const int SOL_RPWM = 4;
+const int SOL_LPWM = 5;
+// Sağ grup (2 motor, paralel)
+const int SAG_RPWM = 6;
+const int SAG_LPWM = 7;
+// Robot kol - alt eksen
+const int ALT_RPWM = 15;
+const int ALT_LPWM = 16;
+// Robot kol - üst eksen
+const int UST_RPWM = 17;
+const int UST_LPWM = 18;
+// Röleler
+const int ROLE_KALKIS = 10;   // Hareket varsa aktif
+const int ROLE_DURUS  = 11;   // Hareket yoksa aktif
+
+// Röle aktif seviyesi (active-LOW modüller için LOW, active-HIGH için HIGH)
+const int ROLE_AKTIF = LOW;
+const int ROLE_PASIF = HIGH;
+
+// ============= PWM AYARLARI =============
+const int PWM_FREK = 5000;       // 5 kHz, sessiz ve BTS7960 için güvenli
+const int PWM_COZUNURLUK = 8;    // 8-bit -> 0..255
+
+// ============= ÇALIŞMA DURUMU =============
+int aracHizi = 200;     // 0..255
+int kolHizi  = 180;
+bool aracHareketli = false;
+
+WebServer sunucu(80);
+
+// ============= RÖLE / DURUM =============
+void hareketDurumGuncelle(bool hareket) {
+  aracHareketli = hareket;
+  digitalWrite(ROLE_KALKIS, hareket ? ROLE_AKTIF : ROLE_PASIF);
+  digitalWrite(ROLE_DURUS,  hareket ? ROLE_PASIF : ROLE_AKTIF);
+  Serial.print("[Durum] Araç: ");
+  Serial.println(hareket ? "HAREKET" : "DURDU");
+}
+
+// ============= MOTOR KONTROL =============
+void solGrupIleri(int hiz) { ledcWrite(SOL_RPWM, hiz); ledcWrite(SOL_LPWM, 0); }
+void solGrupGeri (int hiz) { ledcWrite(SOL_RPWM, 0);   ledcWrite(SOL_LPWM, hiz); }
+void solGrupDur ()         { ledcWrite(SOL_RPWM, 0);   ledcWrite(SOL_LPWM, 0); }
+
+void sagGrupIleri(int hiz) { ledcWrite(SAG_RPWM, hiz); ledcWrite(SAG_LPWM, 0); }
+void sagGrupGeri (int hiz) { ledcWrite(SAG_RPWM, 0);   ledcWrite(SAG_LPWM, hiz); }
+void sagGrupDur ()         { ledcWrite(SAG_RPWM, 0);   ledcWrite(SAG_LPWM, 0); }
+
+void altEksenYukari(int hiz) { ledcWrite(ALT_RPWM, hiz); ledcWrite(ALT_LPWM, 0); }
+void altEksenAsagi (int hiz) { ledcWrite(ALT_RPWM, 0);   ledcWrite(ALT_LPWM, hiz); }
+void altEksenDur ()          { ledcWrite(ALT_RPWM, 0);   ledcWrite(ALT_LPWM, 0); }
+
+void ustEksenYukari(int hiz) { ledcWrite(UST_RPWM, hiz); ledcWrite(UST_LPWM, 0); }
+void ustEksenAsagi (int hiz) { ledcWrite(UST_RPWM, 0);   ledcWrite(UST_LPWM, hiz); }
+void ustEksenDur ()          { ledcWrite(UST_RPWM, 0);   ledcWrite(UST_LPWM, 0); }
+
+// ============= ÜST SEVİYE ARAÇ KOMUTLARI =============
+void aracIleri() { solGrupIleri(aracHizi); sagGrupIleri(aracHizi); hareketDurumGuncelle(true); }
+void aracGeri () { solGrupGeri (aracHizi); sagGrupGeri (aracHizi); hareketDurumGuncelle(true); }
+void aracSol  () { solGrupGeri (aracHizi); sagGrupIleri(aracHizi); hareketDurumGuncelle(true); }  // yerinde dönüş
+void aracSag  () { solGrupIleri(aracHizi); sagGrupGeri (aracHizi); hareketDurumGuncelle(true); }
+void aracDur  () { solGrupDur(); sagGrupDur(); hareketDurumGuncelle(false); }
+
+// ============= WEB SAYFASI =============
+const char SAYFA[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Robot Kontrol</title>
+<style>
+  *{
+    box-sizing:border-box;
+    -webkit-tap-highlight-color:transparent;
+    -webkit-user-select:none;
+    -moz-user-select:none;
+    -ms-user-select:none;
+    user-select:none;
+    -webkit-touch-callout:none;
+    -webkit-user-drag:none;
+  }
+  html,body{overscroll-behavior:none;touch-action:manipulation;}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       margin:0;padding:12px;background:#1a1a1a;color:#eee;}
+  h1{text-align:center;margin:8px 0 16px;font-size:1.4em;}
+  h2{font-size:1em;margin:16px 0 8px;color:#88c0d0;}
+  .panel{background:#2a2a2a;border-radius:12px;padding:12px;margin-bottom:12px;}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+  button{
+    background:#3b4252;color:#eee;border:none;border-radius:10px;
+    padding:22px 0;font-size:1em;font-weight:600;
+    touch-action:manipulation;cursor:pointer;outline:none;
+    transition:background-color 60ms,transform 60ms,box-shadow 60ms;
+  }
+  button.basili{
+    background:#5e81ac;color:#fff;transform:scale(0.94);
+    box-shadow:0 0 0 3px #88c0d0,0 0 22px rgba(136,192,208,0.7);
+  }
+  .ileri{grid-column:2;}
+  .sol  {grid-column:1;grid-row:2;}
+  .dur  {grid-column:2;grid-row:2;background:#bf616a;}
+  .dur.basili{background:#d08770;box-shadow:0 0 0 3px #ebcb8b,0 0 22px rgba(208,135,112,0.7);}
+  .sag  {grid-column:3;grid-row:2;}
+  .geri {grid-column:2;grid-row:3;}
+  .arm-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;}
+  .arm-row .label{display:flex;align-items:center;font-weight:600;
+                  padding-left:4px;color:#d8dee9;}
+  .arm-row button{padding:18px 0;}
+  .speed-row{display:flex;align-items:center;gap:10px;margin:8px 0;}
+  .speed-row label{width:70px;}
+  .speed-row input{flex:1;}
+  .speed-row span{width:40px;text-align:right;}
+  #durum{text-align:center;padding:6px;font-size:0.85em;color:#a3be8c;}
+</style>
+</head>
+<body>
+  <h1>🤖 Robot Kontrol</h1>
+
+  <div class="panel">
+    <h2>Araç</h2>
+    <div class="grid">
+      <button class="ileri" data-bas="ileri" data-birak="dur">▲ İleri</button>
+      <button class="sol"   data-bas="sol"   data-birak="dur">◀ Sol</button>
+      <button class="dur"   id="durBtn">■ DUR</button>
+      <button class="sag"   data-bas="sag"   data-birak="dur">Sağ ▶</button>
+      <button class="geri"  data-bas="geri"  data-birak="dur">▼ Geri</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Robot Kol</h2>
+    <div class="arm-row">
+      <div class="label">Alt eksen</div>
+      <button data-bas="alt_yukari" data-birak="alt_dur">▲ Yukarı</button>
+      <button data-bas="alt_asagi"  data-birak="alt_dur">▼ Aşağı</button>
+    </div>
+    <div class="arm-row">
+      <div class="label">Üst eksen</div>
+      <button data-bas="ust_yukari" data-birak="ust_dur">▲ Yukarı</button>
+      <button data-bas="ust_asagi"  data-birak="ust_dur">▼ Aşağı</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Hız</h2>
+    <div class="speed-row">
+      <label>Araç</label>
+      <input type="range" min="0" max="255" value="200" id="aracHiz" oninput="hizGuncelle()">
+      <span id="aracHizGoster">200</span>
+    </div>
+    <div class="speed-row">
+      <label>Kol</label>
+      <input type="range" min="0" max="255" value="180" id="kolHiz" oninput="hizGuncelle()">
+      <span id="kolHizGoster">180</span>
+    </div>
+  </div>
+
+  <div id="durum">Hazır</div>
+
+<script>
+function komut(k){
+  fetch('/komut?k='+k)
+    .then(r=>r.text())
+    .then(t=>document.getElementById('durum').textContent=t)
+    .catch(e=>document.getElementById('durum').textContent='hata: '+e);
+}
+function hizGuncelle(){
+  const a=document.getElementById('aracHiz').value;
+  const k=document.getElementById('kolHiz').value;
+  document.getElementById('aracHizGoster').textContent=a;
+  document.getElementById('kolHizGoster').textContent=k;
+  fetch(`/hiz?arac=${a}&kol=${k}`);
+}
+
+// --- Bas-çek butonları (çoklu dokunma destekli) ---
+// pointerId -> { btn, birakKomut }
+const aktifPointerlar = new Map();
+
+document.querySelectorAll('[data-bas]').forEach(btn => {
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (aktifPointerlar.has(e.pointerId)) return;
+    // Pointer capture'ı serbest bırak ki parmak kayarsa diğer butonlar da algılansın
+    if (btn.releasePointerCapture) {
+      try { btn.releasePointerCapture(e.pointerId); } catch(_) {}
+    }
+    aktifPointerlar.set(e.pointerId, { btn, birakKomut: btn.dataset.birak });
+    btn.classList.add('basili');
+    if (navigator.vibrate) navigator.vibrate(15);
+    komut(btn.dataset.bas);
+  });
+});
+
+const pointerBirak = (e) => {
+  const aktif = aktifPointerlar.get(e.pointerId);
+  if (!aktif) return;
+  aktif.btn.classList.remove('basili');
+  komut(aktif.birakKomut);
+  aktifPointerlar.delete(e.pointerId);
+};
+
+// Document seviyesinde dinle — parmak butondan kaysa bile dur komutu kesin gider
+document.addEventListener('pointerup', pointerBirak);
+document.addEventListener('pointercancel', pointerBirak);
+
+// Acil DUR butonu (tek tıklama, aynı zamanda her şeyi sıfırlar)
+document.getElementById('durBtn').addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const b = e.currentTarget;
+  b.classList.add('basili');
+  if (navigator.vibrate) navigator.vibrate(40);
+  komut('dur'); komut('alt_dur'); komut('ust_dur');
+  // Aktif tüm pointer'ları temizle
+  aktifPointerlar.forEach(a => a.btn.classList.remove('basili'));
+  aktifPointerlar.clear();
+  setTimeout(() => b.classList.remove('basili'), 180);
+});
+
+// Sayfa arka plana düşerse (telefon kilidi vb.) her şeyi durdur
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    komut('dur'); komut('alt_dur'); komut('ust_dur');
+    aktifPointerlar.forEach(a => a.btn.classList.remove('basili'));
+    aktifPointerlar.clear();
+  }
+});
+
+// Metin seçimini ve sağ-tık menüsünü engelle
+document.addEventListener('selectstart', e => e.preventDefault());
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('dragstart', e => e.preventDefault());
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============= HTTP HANDLER'LARI =============
+void handleRoot() {
+  sunucu.send_P(200, "text/html", SAYFA);
+}
+
+void handleKomut() {
+  if (!sunucu.hasArg("k")) { sunucu.send(400, "text/plain", "komut yok"); return; }
+  String k = sunucu.arg("k");
+
+  if      (k == "ileri")      aracIleri();
+  else if (k == "geri")       aracGeri();
+  else if (k == "sol")        aracSol();
+  else if (k == "sag")        aracSag();
+  else if (k == "dur")        aracDur();
+  else if (k == "alt_yukari") altEksenYukari(kolHizi);
+  else if (k == "alt_asagi")  altEksenAsagi(kolHizi);
+  else if (k == "alt_dur")    altEksenDur();
+  else if (k == "ust_yukari") ustEksenYukari(kolHizi);
+  else if (k == "ust_asagi")  ustEksenAsagi(kolHizi);
+  else if (k == "ust_dur")    ustEksenDur();
+  else { sunucu.send(400, "text/plain", "bilinmeyen komut"); return; }
+
+  Serial.print("[Komut] ");
+  Serial.println(k);
+  sunucu.send(200, "text/plain", "ok:" + k);
+}
+
+void handleHiz() {
+  if (sunucu.hasArg("arac")) aracHizi = constrain(sunucu.arg("arac").toInt(), 0, 255);
+  if (sunucu.hasArg("kol"))  kolHizi  = constrain(sunucu.arg("kol").toInt(),  0, 255);
+  Serial.printf("[Hiz] arac=%d kol=%d\n", aracHizi, kolHizi);
+  sunucu.send(200, "text/plain", "ok");
+}
+
+// ============= SETUP =============
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== Robot Kontrol Başlıyor ===");
+
+  // Röle pinleri — başlangıçta araç dururken duruş rölesi aktif
+  pinMode(ROLE_KALKIS, OUTPUT);
+  pinMode(ROLE_DURUS,  OUTPUT);
+  digitalWrite(ROLE_KALKIS, ROLE_PASIF);
+  digitalWrite(ROLE_DURUS,  ROLE_AKTIF);
+
+  // PWM kanalları
+  ledcAttach(SOL_RPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(SOL_LPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(SAG_RPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(SAG_LPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(ALT_RPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(ALT_LPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(UST_RPWM, PWM_FREK, PWM_COZUNURLUK);
+  ledcAttach(UST_LPWM, PWM_FREK, PWM_COZUNURLUK);
+
+  // Hepsini sıfırla
+  solGrupDur(); sagGrupDur(); altEksenDur(); ustEksenDur();
+
+  // AP başlat
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
+  Serial.print("AP IP adresi: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.printf("SSID: %s  Şifre: %s\n", AP_SSID, AP_PASS);
+
+  // Endpoint'ler
+  sunucu.on("/", handleRoot);
+  sunucu.on("/komut", handleKomut);
+  sunucu.on("/hiz", handleHiz);
+  sunucu.onNotFound([](){ sunucu.send(404, "text/plain", "yok"); });
+  sunucu.begin();
+  Serial.println("Web sunucu başladı.\n");
+}
+
+// ============= LOOP =============
+void loop() {
+  sunucu.handleClient();
+}
